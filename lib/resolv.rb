@@ -564,6 +564,9 @@ class Resolv
               # Retry via TCP:
               truncated[candidate] = true
               redo
+            elsif reply.answer.empty?
+              # NODATA:
+              raise Config::NoData.new(reply_name.to_s)
             else
               yield(reply, reply_name)
             end
@@ -1173,7 +1176,7 @@ class Resolv
               }
               timeout_error = true
               raise ResolvError.new("DNS resolv timeout: #{name}")
-            rescue NXDomain
+            rescue NXDomain, NoData
             end
           }
         rescue ResolvError
@@ -1185,6 +1188,12 @@ class Resolv
       # Indicates no such domain was found.
 
       class NXDomain < ResolvError
+      end
+
+      ##
+      # Indicates the domain exists but has no data for the requested type.
+
+      class NoData < ResolvError
       end
 
       ##
