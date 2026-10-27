@@ -587,6 +587,8 @@ class Resolv
             return
           when RCode::NXDomain
             raise Config::NXDomain.new(reply_name.to_s)
+          when RCode::ServFail
+            raise Config::ServFail.new(reply_name.to_s)
           else
             raise Config::OtherResolvError.new(reply_name.to_s)
           end
@@ -1284,16 +1286,22 @@ class Resolv
           candidates.each {|candidate|
             begin
               timeouts.each {|tout|
+                timed_out = false
+                failed = nil
                 @nameserver_port.each {|nameserver, port|
                   begin
                     yield candidate, tout, nameserver, port
                   rescue ResolvTimeout
+                    timed_out = true
+                  rescue OtherResolvError => e
+                    failed = e unless ServFail === failed
                   end
                 }
+                raise failed if failed && !timed_out # nothing left to wait for
               }
               timeout_error = true
               raise ResolvError.new("DNS resolv timeout: #{name}")
-            rescue NXDomain
+            rescue NXDomain, ServFail
             end
           }
         rescue ResolvError
@@ -1311,6 +1319,12 @@ class Resolv
       # Indicates some other unhandled resolver error was encountered.
 
       class OtherResolvError < ResolvError
+      end
+
+      ##
+      # Indicates the name server failed to process the query.
+
+      class ServFail < OtherResolvError
       end
     end
 

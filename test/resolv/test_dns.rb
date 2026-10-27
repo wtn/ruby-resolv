@@ -1615,4 +1615,249 @@ class TestResolvDNS < Test::Unit::TestCase
       end
     end
   end
+
+  # Answers +count+ queries on +u+ with the reply the block returns, if any.
+  def answer_udp(u, count)
+    count.times do
+      msg, (_, client_port, _, client_address) =
+        Timeout.timeout(EnvUtil.apply_timeout_scale(10)) { u.recvfrom(4096) }
+      reply = yield Resolv::DNS::Message.decode(msg)
+      u.send(reply.encode, 0, client_address, client_port) if reply
+    end
+  end
+
+  # Builds the reply to +query+ with +rcode+ and, if given, one A record.
+  def reply_with_rcode(query, rcode, address = nil)
+    reply = Resolv::DNS::Message.new(query.id)
+    reply.qr = 1
+    reply.rd = query.rd
+    reply.ra = 1
+    reply.rcode = rcode
+    query.each_question do |name, typeclass|
+      reply.add_question(name, typeclass)
+      reply.add_answer(name, 3600, Resolv::DNS::Resource::IN::A.new(address)) if address
+    end
+    reply
+  end
+
+  def servfail(query)
+    reply_with_rcode(query, Resolv::DNS::RCode::ServFail)
+  end
+
+  def answer(query, address)
+    reply_with_rcode(query, Resolv::DNS::RCode::NoError, address)
+  end
+
+  # Looks up the A records of +name+ with short timeouts.
+  def addresses_from(nameserver_port, name, **config)
+    Resolv::DNS.open(nameserver_port: nameserver_port, search: [], ndots: 1, **config) do |dns|
+      dns.timeouts = [EnvUtil.apply_timeout_scale(0.5), EnvUtil.apply_timeout_scale(5)]
+      Timeout.timeout(EnvUtil.apply_timeout_scale(20)) do
+        dns.getresources(name, Resolv::DNS::Resource::IN::A).map {|rr| rr.address.to_s }
+      end
+    end
+  end
+
+  def test_servfail_falls_back_to_the_next_nameserver
+    with_udp('127.0.0.1', 0) do |u1|
+      with_udp('127.0.0.1', 0) do |u2|
+        _, port1, _, address1 = u1.addr
+        _, port2, _, address2 = u2.addr
+
+        client_thread = Thread.new do
+          addresses_from([[address1, port1], [address2, port2]], 'foo.example.org')
+        end
+        server1_thread = Thread.new { answer_udp(u1, 1) {|query| servfail(query) } }
+        server2_thread = Thread.new { answer_udp(u2, 1) {|query| answer(query, '192.0.2.1') } }
+
+        result, = assert_join_threads([client_thread, server1_thread, server2_thread])
+        assert_equal(['192.0.2.1'], result)
+      end
+    end
+  end
+
+  def test_servfail_from_every_nameserver_moves_on_to_the_next_candidate
+    with_udp('127.0.0.1', 0) do |u|
+      _, port, _, address = u.addr
+
+      client_thread = Thread.new do
+        addresses_from([[address, port]], 'foo', search: ['bad.example', 'good.example'])
+      end
+      server_thread = Thread.new do
+        answer_udp(u, 2) do |query|
+          if query.question[0][0].to_s == 'foo.bad.example'
+            servfail(query)
+          else
+            answer(query, '192.0.2.1')
+          end
+        end
+      end
+
+      result, = assert_join_threads([client_thread, server_thread])
+      assert_equal(['192.0.2.1'], result)
+    end
+  end
+
+  def test_servfail_with_a_timeout_from_another_nameserver_retries
+    with_udp('127.0.0.1', 0) do |u1|
+      with_udp('127.0.0.1', 0) do |u2|
+        _, port1, _, address1 = u1.addr
+        _, port2, _, address2 = u2.addr
+
+        client_thread = Thread.new do
+          addresses_from([[address1, port1], [address2, port2]], 'foo.example.org')
+        end
+        server1_thread = Thread.new { answer_udp(u1, 2) {|query| servfail(query) } }
+        server2_thread = Thread.new do
+          queries = 0
+          answer_udp(u2, 2) do |query|
+            queries += 1
+            answer(query, '192.0.2.1') if queries == 2 # stay silent the first time
+          end
+        end
+
+        result, = assert_join_threads([client_thread, server1_thread, server2_thread])
+        assert_equal(['192.0.2.1'], result)
+      end
+    end
+  end
+
+  def test_servfail_for_every_candidate_is_empty
+    with_udp('127.0.0.1', 0) do |u|
+      _, port, _, address = u.addr
+
+      client_thread = Thread.new do
+        addresses_from([[address, port]], 'foo', search: ['a.example', 'b.example'])
+      end
+      server_thread = Thread.new do
+        queries = []
+        answer_udp(u, 3) do |query|
+          queries << query.question[0][0].to_s
+          servfail(query)
+        end
+        queries
+      end
+
+      result, queries = assert_join_threads([client_thread, server_thread])
+      assert_equal([], result)
+      assert_equal(['foo.a.example', 'foo.b.example', 'foo'], queries)
+    end
+  end
+
+  def test_servfail_over_tcp_falls_back_to_the_next_nameserver
+    with_udp_and_tcp('127.0.0.1', 0) do |u1, t1|
+      with_udp_and_tcp('127.0.0.1', 0) do |u2, t2|
+        u2.close # only the TCP side of the second nameserver is used
+        _, port1, _, address1 = u1.addr
+        _, port2, _, address2 = t2.addr
+
+        client_thread = Thread.new do
+          addresses_from([[address1, port1], [address2, port2]], 'foo.example.org')
+        end
+        udp_server1_thread = Thread.new { answer_truncated(u1) }
+        tcp_server1_thread = Thread.new do
+          ct = accept_within_timeout(t1)
+          begin
+            ct.write(framed(servfail(read_framed_query(ct)).encode))
+          ensure
+            ct.close
+          end
+        end
+        tcp_server2_thread = Thread.new do
+          ct = accept_within_timeout(t2)
+          begin
+            ct.write(framed(reply_for_query(read_framed_query(ct), '192.0.2.1')))
+          ensure
+            ct.close
+          end
+        end
+
+        result, = assert_join_threads([client_thread, udp_server1_thread,
+                                       tcp_server1_thread, tcp_server2_thread])
+        assert_equal(['192.0.2.1'], result)
+      end
+    end
+  end
+
+  def test_servfail_from_every_nameserver_is_not_a_timeout
+    with_udp('127.0.0.1', 0) do |u|
+      _, port, _, address = u.addr
+
+      client_thread = Thread.new do
+        addresses_from([[address, port]], 'foo.example.org', raise_timeout_errors: true)
+      end
+      server_thread = Thread.new { answer_udp(u, 1) {|query| servfail(query) } }
+
+      result, = assert_join_threads([client_thread, server_thread])
+      assert_equal([], result)
+    end
+  end
+
+  def refused(query)
+    reply_with_rcode(query, Resolv::DNS::RCode::Refused)
+  end
+
+  def test_refused_falls_back_to_the_next_nameserver
+    with_udp('127.0.0.1', 0) do |u1|
+      with_udp('127.0.0.1', 0) do |u2|
+        _, port1, _, address1 = u1.addr
+        _, port2, _, address2 = u2.addr
+
+        client_thread = Thread.new do
+          addresses_from([[address1, port1], [address2, port2]], 'foo.example.org')
+        end
+        server1_thread = Thread.new { answer_udp(u1, 1) {|query| refused(query) } }
+        server2_thread = Thread.new { answer_udp(u2, 1) {|query| answer(query, '192.0.2.1') } }
+
+        result, = assert_join_threads([client_thread, server1_thread, server2_thread])
+        assert_equal(['192.0.2.1'], result)
+      end
+    end
+  end
+
+  def test_refused_from_every_nameserver_ends_the_search
+    with_udp('127.0.0.1', 0) do |u|
+      _, port, _, address = u.addr
+
+      client_thread = Thread.new do
+        addresses_from([[address, port]], 'foo', search: ['a.example', 'b.example'])
+      end
+      server_thread = Thread.new do
+        queries = []
+        record = lambda do |query|
+          queries << query.question[0][0].to_s
+          refused(query)
+        end
+        answer_udp(u, 1, &record)
+        while IO.select([u], nil, nil, EnvUtil.apply_timeout_scale(1))
+          answer_udp(u, 1, &record)
+        end
+        queries
+      end
+
+      result, queries = assert_join_threads([client_thread, server_thread])
+      assert_equal([], result)
+      assert_equal(['foo.a.example'], queries)
+    end
+  end
+
+  def test_servfail_wins_over_refused_in_the_same_round
+    with_udp('127.0.0.1', 0) do |u1|
+      with_udp('127.0.0.1', 0) do |u2|
+        _, port1, _, address1 = u1.addr
+        _, port2, _, address2 = u2.addr
+
+        client_thread = Thread.new do
+          addresses_from([[address1, port1], [address2, port2]], 'foo', search: ['a.example', 'b.example'])
+        end
+        server1_thread = Thread.new do
+          answer_udp(u1, 2) {|query| query.question[0][0].to_s == 'foo.a.example' ? servfail(query) : answer(query, '192.0.2.1') }
+        end
+        server2_thread = Thread.new { answer_udp(u2, 1) {|query| refused(query) } }
+
+        result, = assert_join_threads([client_thread, server1_thread, server2_thread])
+        assert_equal(['192.0.2.1'], result)
+      end
+    end
+  end
 end
